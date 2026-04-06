@@ -1,0 +1,230 @@
+# llm_research_pipeline.py
+
+from openai import OpenAI
+from collections import Counter
+import math
+import json
+import time
+import random
+from typing import List, Dict, Any
+
+
+# =====================================
+# ⚙️ 全局配置（可实验调参）
+# =====================================
+CONFIG = {
+    "model": "gpt-4o-mini",
+    "n_samples": 7,
+    "temperature": 0.7,
+    "max_retries": 3,
+    "entropy_threshold": 1.0,
+    "min_valid_samples": 3
+}
+
+
+# =====================================
+# 🔑 初始化
+# =====================================
+def init_client(api_key: str) -> OpenAI:
+    return OpenAI(api_key=api_key)
+
+
+# =====================================
+# 🧠 Prompt设计（研究级）
+# =====================================
+def build_prompt(text: str) -> Dict[str, str]:
+    system_prompt = """
+You are an expert-level sentiment analysis system.
+
+Strictly follow these instructions:
+1. Classify sentiment into ONE of: Positive, Negative, Neutral, Mixed
+2. Provide confidence (0-1)
+3. Provide a concise explanation (1-2 sentences)
+4. Extract 3-6 key phrases from the input
+
+Return ONLY valid JSON:
+{
+  "sentiment": "...",
+  "confidence": 0.0,
+  "explanation": "...",
+  "key_phrases": ["...", "..."]
+}
+"""
+    user_prompt = f"Text:\n{text}"
+    return {"system": system_prompt, "user": user_prompt}
+
+
+# =====================================
+# 🔍 JSON解析（鲁棒）
+# =====================================
+def safe_json_parse(content: str) -> Dict[str, Any]:
+    try:
+        return json.loads(content)
+    except:
+        start = content.find("{")
+        end = content.rfind("}")
+        if start != -1 and end != -1:
+            return json.loads(content[start:end+1])
+        raise ValueError("Invalid JSON output from LLM")
+
+
+# =====================================
+# 🧠 单次推理（带retry）
+# =====================================
+def single_inference(client: OpenAI, text: str) -> Dict[str, Any]:
+    prompt = build_prompt(text)
+
+    for attempt in range(CONFIG["max_retries"]):
+        try:
+            response = client.chat.completions.create(
+                model=CONFIG["model"],
+                messages=[
+                    {"role": "system", "content": prompt["system"]},
+                    {"role": "user", "content": prompt["user"]}
+                ],
+                temperature=CONFIG["temperature"]
+            )
+
+            content = response.choices[0].message.content.strip()
+            data = safe_json_parse(content)
+
+            # 基本校验
+            if "sentiment" not in data:
+                raise ValueError("Missing sentiment field")
+
+            return data
+
+        except Exception as e:
+            if attempt == CONFIG["max_retries"] - 1:
+                return {"error": str(e)}
+            time.sleep(0.5)
+
+    return {"error": "Unknown failure"}
+
+
+# =====================================
+# 🔁 多采样（带异常过滤）
+# =====================================
+def multi_sample(client: OpenAI, text: str) -> List[Dict[str, Any]]:
+    results = []
+
+    for _ in range(CONFIG["n_samples"]):
+        res = single_inference(client, text)
+
+        if "error" not in res:
+            results.append(res)
+
+    return results
+
+
+# =====================================
+# 📊 不确定性计算（多指标）
+# =====================================
+def compute_uncertainty(results: List[Dict]) -> Dict[str, float]:
+    sentiments = [r["sentiment"] for r in results]
+
+    counter = Counter(sentiments)
+    total = sum(counter.values())
+
+    probs = [v / total for v in counter.values()]
+
+    # Shannon entropy
+    entropy = -sum(p * math.log(p + 1e-9) for p in probs)
+
+    # Variation ratio（补充指标）
+    max_prob = max(probs)
+    variation_ratio = 1 - max_prob
+
+    return {
+        "entropy": entropy,
+        "variation_ratio": variation_ratio
+    }
+
+
+# =====================================
+# 🧠 聚合（更严谨）
+# =====================================
+def aggregate(results: List[Dict]) -> Dict[str, Any]:
+    sentiments = [r["sentiment"] for r in results]
+
+    majority = Counter(sentiments).most_common(1)[0][0]
+
+    # 平均confidence（来自LLM）
+    confs = [r.get("confidence", 0.5) for r in results]
+    avg_conf = sum(confs) / len(confs)
+
+    # 收集解释（避免单点偏差）
+    explanations = [r.get("explanation", "") for r in results]
+
+    return {
+        "prediction": majority,
+        "model_confidence": avg_conf,
+        "explanations": explanations[:2]  # 保留2个
+    }
+
+
+# =====================================
+# 🎯 决策层（关键）
+# =====================================
+def decision(results: List[Dict]) -> Dict[str, Any]:
+
+    if len(results) < CONFIG["min_valid_samples"]:
+        return {
+            "status": "FAILED",
+            "reason": "Too many failed LLM calls"
+        }
+
+    uncertainty = compute_uncertainty(results)
+    agg = aggregate(results)
+
+    entropy = uncertainty["entropy"]
+
+    # 归一化confidence
+    confidence = 1 / (1 + entropy)
+
+    # 决策逻辑（核心）
+    if entropy < CONFIG["entropy_threshold"]:
+        status = "ACCEPTED"
+    else:
+        status = "ABSTAIN"
+
+    return {
+        "prediction": agg["prediction"],
+        "confidence": round(confidence, 3),
+        "entropy": round(entropy, 3),
+        "variation_ratio": round(uncertainty["variation_ratio"], 3),
+        "model_confidence": round(agg["model_confidence"], 3),
+        "status": status,
+        "explanations": agg["explanations"],
+        "num_samples": len(results)
+    }
+
+
+# =====================================
+# 🚀 主Pipeline
+# =====================================
+def run_pipeline(client: OpenAI, text: str) -> Dict[str, Any]:
+    start = time.time()
+
+    results = multi_sample(client, text)
+
+    decision_output = decision(results)
+
+    decision_output["latency"] = round(time.time() - start, 2)
+
+    return decision_output
+
+
+# =====================================
+# 🧪 Demo
+# =====================================
+if __name__ == "__main__":
+    API_KEY = "YOUR_API_KEY"
+
+    client = init_client(API_KEY)
+
+    test_text = "这个产品质量很好，但是售后服务很差"
+
+    result = run_pipeline(client, test_text)
+
+    print(json.dumps(result, indent=2, ensure_ascii=False))
